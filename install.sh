@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # Install Eradani Personas on a blank Debian or Ubuntu server: clone the newest release tag over SSH
 # with a read-only deploy key this server makes, then run the checkout's install.sh.
-#   curl -fsSL <url> | sudo bash -s -- [--ref <tag|branch>] [--clone-only] [-- <install.sh args>]
+#   curl -fsSL <url> | sudo bash -s -- [--ref <tag|branch>] [--checkout DIR] [--clone-only] [-- <install.sh args>]
 # PERSONAS_REPO and PERSONAS_KNOWN_HOSTS (a file replacing GitHub's keys) override the repo and host keys.
+# The checkout goes in /opt/eradani/eradani-personas, or in DIR (--checkout, or PERSONAS_CHECKOUT).
+# A server whose /etc/eradani-personas/personas.env names its checkout, or that has one at
+# /opt/eradani-personas, keeps it.
 set -euo pipefail
 
 readonly ETC=/etc/eradani-personas
 readonly KEY=$ETC/deploy-key
 readonly KNOWN_HOSTS=$ETC/known_hosts
-readonly DEST=/opt/eradani-personas
+readonly ENV_FILE=$ETC/personas.env
+readonly LEGACY_CHECKOUT=/opt/eradani-personas
+readonly DEFAULT_CHECKOUT=/opt/eradani/eradani-personas
+# The checkout's directory, set by main from resolve_checkout
+DEST=
 readonly DEFAULT_REPO=git@github.com:eradani-inc/eradani-personas.git
 
 die() { local code=$1; shift; printf 'install: %s\n' "$*" >&2; exit "$code"; }
@@ -17,6 +24,34 @@ probe_uid() { id -u; }
 probe_has() { command -v "$1" >/dev/null 2>&1; }
 probe_id() { sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"'; }
 probe_installed() { [[ -e $DEST/.git ]]; }
+probe_legacy_checkout() { [[ -e $LEGACY_CHECKOUT/.git ]]; }
+
+# The checkout directory personas.env ($1) records, empty when it records none
+recorded_checkout() { sed -n 's/^PERSONAS_CHECKOUT=//p' "$1" 2>/dev/null | tail -n 1 || true; }
+
+# First match wins: what personas.env records, the operator's PERSONAS_CHECKOUT, an old install's
+# /opt/eradani-personas, then the default. Moving an install's checkout isn't supported, so
+# main refuses a PERSONAS_CHECKOUT that differs from the record.
+resolve_checkout() {
+  local recorded
+  recorded=$(recorded_checkout "$1")
+  if [[ -n $recorded ]]; then echo "$recorded"
+  elif [[ -n ${PERSONAS_CHECKOUT:-} ]]; then echo "$PERSONAS_CHECKOUT"
+  elif probe_legacy_checkout; then echo "$LEGACY_CHECKOUT"
+  else echo "$DEFAULT_CHECKOUT"
+  fi
+}
+
+# Refuses, before anything changes, a directory personas.env and the worker's unit can't hold
+# unquoted, and one that would move an install's checkout.
+check_checkout_request() {
+  local recorded
+  [[ -z ${PERSONAS_CHECKOUT:-} || $PERSONAS_CHECKOUT =~ ^(/[A-Za-z0-9._-]+)+$ ]] \
+    || die 2 "the checkout $PERSONAS_CHECKOUT must be an absolute path of letters, digits and . _ / - only"
+  recorded=$(recorded_checkout "$ENV_FILE")
+  [[ -z $recorded || -z ${PERSONAS_CHECKOUT:-} || $recorded == "$PERSONAS_CHECKOUT" ]] \
+    || die 2 "$ENV_FILE records the checkout $recorded but the checkout asked for is $PERSONAS_CHECKOUT; moving an install's checkout isn't supported"
+}
 
 install_packages() {
   {
@@ -46,7 +81,9 @@ ls_remote() { git ls-remote --tags --sort=-v:refname "$1" 'v*'; }
 pick_tag() { sed -n 's|^[0-9a-f]\{40,\}[[:space:]]refs/tags/\(v[0-9]\{1,\}\.[0-9]\{1,\}\.[0-9]\{1,\}\)$|\1|;T;p;q'; }
 
 clone() {
-  tmp=$(mktemp -d /opt/.eradani-personas.XXXXXX)
+  # The parent may already belong to another Eradani product, so an existing one is left as it is.
+  mkdir -p "$(dirname "$DEST")"
+  tmp=$(mktemp -d "$(dirname "$DEST")/.eradani-personas.XXXXXX")
   trap 'rm -rf "$tmp"' EXIT
   chmod 755 "$tmp" # mktemp makes it 0700, and the containers read the checkout
   git -c advice.detachedHead=false clone --quiet --branch "$2" "$1" "$tmp" \
@@ -82,11 +119,16 @@ main() {
   while (($#)); do
     case $1 in
       --ref) (($# >= 2)) || die 2 "--ref needs a tag or branch"; ref=$2; shift 2 ;;
+      --checkout) (($# >= 2)) || die 2 "--checkout needs a directory"; PERSONAS_CHECKOUT=$2; shift 2 ;;
       --clone-only) clone_only=1; shift ;;
       --) shift; break ;;
-      *) die 2 "unknown argument $1; usage: bash -s -- [--ref <tag|branch>] [--clone-only] [-- <install.sh args>]" ;;
+      *) die 2 "unknown argument $1; usage: bash -s -- [--ref <tag|branch>] [--checkout DIR] [--clone-only] [-- <install.sh args>]" ;;
     esac
   done
+  check_checkout_request
+  DEST=$(resolve_checkout "$ENV_FILE")
+  # A fresh install.sh has no personas.env yet, so it learns the directory from here.
+  export PERSONAS_CHECKOUT=$DEST
   [[ $(probe_uid) == 0 ]] || die 10 "run this as root, for example with sudo bash"
   if ! probe_has git || ! probe_has ssh-keygen; then
     probe_has apt-get || die 10 "this server is $(probe_id), and the stub installs git and openssh-client only with apt; install them and run this again"
